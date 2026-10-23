@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 artifacts/
 .ipynb_checkpoints/
+spotify_popularity_model.pkl

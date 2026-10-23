@@ -9,6 +9,17 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, r2_score
+
+try:
+    from cassandra.cluster import Cluster
+except ImportError:
+    Cluster = None
 
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Spotify Data Lab", page_icon=None, layout="wide", initial_sidebar_state="expanded")
@@ -70,11 +81,36 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_data():
+    # Prefer notebook output if available; otherwise read directly from Cassandra.
     if os.path.exists(CSV_PATH):
         return pd.read_csv(CSV_PATH), f"Processed CSV: {CSV_PATH}"
-    return pd.DataFrame(), "Processed CSV not found"
+
+    if Cluster is not None:
+        cluster = None
+        try:
+            host = os.getenv("CASSANDRA_HOST", "127.0.0.1")
+            port = int(os.getenv("CASSANDRA_PORT", "9042"))
+            keyspace = os.getenv("CASSANDRA_KEYSPACE", "spotify")
+            table = os.getenv("CASSANDRA_TABLE", "spotify_youtube_full")
+            cluster = Cluster([host], port=port)
+            session = cluster.connect(keyspace)
+            rows = session.execute(f"SELECT * FROM {table}")
+            data = pd.DataFrame([row._asdict() for row in rows])
+            session.shutdown()
+            cluster.shutdown()
+            if not data.empty:
+                return data, f"Cassandra: {keyspace}.{table}"
+        except Exception as exc:
+            if cluster is not None:
+                try:
+                    cluster.shutdown()
+                except Exception:
+                    pass
+            return pd.DataFrame(), f"Could not read CSV or Cassandra ({exc})"
+
+    return pd.DataFrame(), "No processed CSV found and Cassandra driver/connection unavailable"
 
 @st.cache_resource(show_spinner=False)
 def load_model_artifacts():
@@ -93,7 +129,8 @@ def load_model_artifacts():
 df, data_source = load_data()
 model, model_features, saved_medians = load_model_artifacts()
 if df.empty:
-    st.error("Processed song data was not found. Run the notebook's final save-results cell first.")
+    st.error("Song data could not be loaded. Either create spotify_model_outputs/processed_songs.csv or start Cassandra and run the ingestion notebook.")
+    st.caption("Cassandra defaults: host 127.0.0.1, port 9042, keyspace spotify, table spotify_youtube_full. Override with CASSANDRA_HOST, CASSANDRA_PORT, CASSANDRA_KEYSPACE, CASSANDRA_TABLE.")
     st.code("python -m streamlit run app.py")
     st.stop()
 
@@ -107,6 +144,65 @@ artist_col = next((c for c in ["artist", "artist_name"] if c in df.columns), Non
 audio_features = [c for c in AUDIO_CANDIDATES if c in df.columns and df[c].notna().any()]
 df["_track_display"] = df[track_col].fillna("").astype(str).str.strip() if track_col else ""
 df["_artist_display"] = df[artist_col].fillna("").astype(str).str.strip() if artist_col else ""
+
+# Train a model automatically if the notebook's saved model files are not present.
+# The model predicts the custom popularity score using audio features only.
+model_results = pd.DataFrame()
+if (model is None or not model_features) and "popularity_score" in df.columns and len(audio_features) >= 1:
+    ml_data = df.dropna(subset=["popularity_score"]).copy()
+    ml_features = [c for c in audio_features if c in ml_data.columns and ml_data[c].notna().any()]
+    if len(ml_data) >= 10 and ml_features:
+        X = ml_data[ml_features].replace([np.inf, -np.inf], np.nan)
+        y = pd.to_numeric(ml_data["popularity_score"], errors="coerce")
+        valid = y.notna()
+        X, y = X.loc[valid], y.loc[valid]
+        if len(X) >= 10:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.2, random_state=42
+            )
+            candidates = {
+                "Linear Regression": make_pipeline(
+                    SimpleImputer(strategy="median"), StandardScaler(), LinearRegression()
+                ),
+                "Random Forest": make_pipeline(
+                    SimpleImputer(strategy="median"),
+                    RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+                ),
+                "Gradient Boosting": make_pipeline(
+                    SimpleImputer(strategy="median"),
+                    GradientBoostingRegressor(random_state=42)
+                ),
+            }
+            fitted = {}
+            rows = []
+            for name, candidate in candidates.items():
+                try:
+                    candidate.fit(X_train, y_train)
+                    prediction = candidate.predict(X_test)
+                    fitted[name] = candidate
+                    rows.append({
+                        "Model": name,
+                        "R²": r2_score(y_test, prediction),
+                        "MAE": mean_absolute_error(y_test, prediction),
+                    })
+                except Exception:
+                    continue
+            if rows:
+                model_results = pd.DataFrame(rows).sort_values("MAE")
+                best_name = model_results.iloc[0]["Model"]
+                model = fitted[best_name]
+                model_features = ml_features
+                saved_medians = X.median().fillna(0).to_dict()
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                try:
+                    with open(MODEL_PATH, "wb") as f:
+                        pickle.dump(model, f)
+                    with open(FEATURES_PATH, "wb") as f:
+                        pickle.dump(model_features, f)
+                    with open(MEDIANS_PATH, "wb") as f:
+                        pickle.dump(saved_medians, f)
+                except Exception:
+                    pass
 
 def chart_layout(fig, height=340, title=None):
     fig.update_layout(
@@ -131,8 +227,8 @@ st.sidebar.metric("Artists", f"{df['_artist_display'].replace('', np.nan).nuniqu
 st.sidebar.metric("Audio features", len(audio_features))
 st.sidebar.metric("Model status", "Loaded" if model is not None else "Not loaded")
 
-overview_tab, explore_tab, recommend_tab, demo_tab, weights_tab = st.tabs([
-    "Overview", "Explore Songs", "Recommendations", "Model Demo", "Feature Weights"
+overview_tab, artists_tab, explore_tab, recommend_tab, demo_tab, weights_tab = st.tabs([
+    "Overview", "Top Artists", "Explore Songs", "Recommendations", "Model Demo", "Feature Weights"
 ])
 
 with overview_tab:
@@ -172,6 +268,53 @@ with overview_tab:
             [0, "#363636"], [0.5, "#171717"], [1, ORANGE]
         ], aspect="auto", text_auto=".2f")
         st.plotly_chart(chart_layout(fig, max(350, min(600, 26 * len(audio_features))), "Audio Feature Correlation Matrix"), use_container_width=True)
+
+with artists_tab:
+    st.subheader("Most popular artists")
+    st.caption("Artists are ranked by the sum of their song streams, not by the custom ML popularity score.")
+    if not artist_col or "stream" not in df.columns:
+        st.warning("Artist and stream columns are required for this analysis.")
+    else:
+        stream_data = df.copy()
+        stream_data["stream"] = pd.to_numeric(stream_data["stream"], errors="coerce")
+        artist_totals = (
+            stream_data.dropna(subset=[artist_col, "stream"])
+            .groupby(artist_col, as_index=False)["stream"].sum()
+            .rename(columns={artist_col: "Artist", "stream": "Total Streams"})
+            .sort_values("Total Streams", ascending=False)
+        )
+        top3 = artist_totals.head(3)
+        if top3.empty:
+            st.info("No stream totals were found.")
+        else:
+            first = top3.iloc[0]
+            st.metric("Most popular artist", str(first["Artist"]),
+                      help=f"Total streams: {first['Total Streams']:,.0f}")
+            st.dataframe(top3.style.format({"Total Streams": "{:,.0f}"}), use_container_width=True, hide_index=True)
+            fig = px.bar(top3, x="Artist", y="Total Streams", text="Total Streams")
+            fig.update_traces(marker_color=ORANGE, texttemplate="%{text:,.0f}", textposition="outside")
+            st.plotly_chart(chart_layout(fig, 360, "Top 3 Artists by Total Streams"), use_container_width=True)
+
+            st.subheader("Top 5 songs for each top artist")
+            if not track_col:
+                st.warning("Track column was not found.")
+            else:
+                song_totals = (
+                    stream_data.dropna(subset=[artist_col, track_col, "stream"])
+                    .groupby([artist_col, track_col], as_index=False)["stream"].sum()
+                    .rename(columns={artist_col: "Artist", track_col: "Song", "stream": "Total Streams"})
+                )
+                song_totals = song_totals[song_totals["Artist"].isin(top3["Artist"])]
+                song_totals = song_totals.sort_values(["Artist", "Total Streams"], ascending=[True, False])
+                song_totals["Rank"] = song_totals.groupby("Artist")["Total Streams"].rank(method="first", ascending=False).astype(int)
+                top_songs = song_totals[song_totals["Rank"] <= 5][["Artist", "Rank", "Song", "Total Streams"]]
+                st.dataframe(top_songs.style.format({"Total Streams": "{:,.0f}"}), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download top artists and songs CSV",
+                    top_songs.to_csv(index=False).encode("utf-8"),
+                    file_name="top_artists_top_songs.csv",
+                    mime="text/csv",
+                )
 
 with explore_tab:
     st.subheader("Explore the catalogue")
@@ -286,9 +429,26 @@ with demo_tab:
             st.caption("Prediction of the project's custom score, not Spotify's official popularity score.")
 
 with weights_tab:
+    st.subheader("ML model comparison")
+    if not model_results.empty:
+        st.dataframe(
+            model_results.style.format({"R²": "{:.3f}", "MAE": "{:.3f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("The model with the lowest MAE is selected automatically. Metrics are calculated on a held-out test split.")
+    elif model is not None:
+        st.caption("A saved model is loaded. Model-comparison metrics are shown only when this app trains models from the current data.")
+
     st.subheader("Feature importance and relative weights")
-    if model is not None and model_features and hasattr(model, "feature_importances_"):
-        importance = pd.DataFrame({"Feature": model_features, "Importance": model.feature_importances_}).sort_values("Importance", ascending=False)
+    tree_estimator = None
+    if model is not None:
+        if hasattr(model, "feature_importances_"):
+            tree_estimator = model
+        elif hasattr(model, "named_steps"):
+            tree_estimator = model.named_steps.get("randomforestregressor") or model.named_steps.get("gradientboostingregressor")
+    if model is not None and model_features and tree_estimator is not None and hasattr(tree_estimator, "feature_importances_"):
+        importance = pd.DataFrame({"Feature": model_features, "Importance": tree_estimator.feature_importances_}).sort_values("Importance", ascending=False)
         total = importance["Importance"].sum()
         importance["Weight (%)"] = ((importance["Importance"] / total) * 100).round(2) if total > 0 else 0.0
         st.dataframe(importance, use_container_width=True, hide_index=True)
@@ -302,4 +462,4 @@ with weights_tab:
         st.info("Feature importance is unavailable. Train/load the updated model first.")
 
 st.divider()
-st.caption("Feature importance shows relative model contribution, not causality. Likes/comments in both predictors and target construction can cause target leakage.")
+st.caption("ML predicts the project's custom popularity score using audio features. Feature importance is not causality. Artist rankings use summed stream counts.")
