@@ -3,3 +3,8 @@ pandas
 numpy
 plotly
 scikit-learn
+
+# Notebook + PySpark MLlib pipeline (Spotify_PySpark_MLlib.ipynb, app.py model backend)
+pyspark==3.5.8
+cassandra-driver
+matplotlib

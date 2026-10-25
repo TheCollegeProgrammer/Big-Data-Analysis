@@ -30,6 +30,16 @@ MODEL_PATH = os.path.join(OUTPUT_DIR, "popularity_model.pkl")
 FEATURES_PATH = os.path.join(OUTPUT_DIR, "model_features.pkl")
 MEDIANS_PATH = os.path.join(OUTPUT_DIR, "audio_feature_medians.pkl")
 
+# PipelineModel written by Spotify_PySpark_MLlib.ipynb (section 10).
+SPARK_MODEL_DIR = "spotify_popularity_model"
+# Same feature order the notebook trains on: 11 audio features + log1p(stream).
+SPARK_AUDIO = [
+    "danceability", "energy", "key", "loudness", "speechiness",
+    "acousticness", "instrumentalness", "liveness", "valence",
+    "tempo", "duration_ms",
+]
+SPARK_FEATURES = SPARK_AUDIO + ["log1p_stream"]
+
 AUDIO_CANDIDATES = [
     "danceability", "energy", "key", "loudness", "speechiness",
     "acousticness", "instrumentalness", "liveness", "valence",
@@ -83,10 +93,8 @@ st.markdown("""
 
 @st.cache_data(show_spinner=False, ttl=300)
 def load_data():
-    # Prefer notebook output if available; otherwise read directly from Cassandra.
-    if os.path.exists(CSV_PATH):
-        return pd.read_csv(CSV_PATH), f"Processed CSV: {CSV_PATH}"
-
+    # The notebooks write their results (audio features + popularity_score +
+    # score_version) to Cassandra, so prefer it over the processed CSV.
     if Cluster is not None:
         cluster = None
         try:
@@ -108,9 +116,14 @@ def load_data():
                     cluster.shutdown()
                 except Exception:
                     pass
-            return pd.DataFrame(), f"Could not read CSV or Cassandra ({exc})"
+            if os.path.exists(CSV_PATH):
+                return pd.read_csv(CSV_PATH), f"Processed CSV: {CSV_PATH} (Cassandra unavailable: {exc})"
+            return pd.DataFrame(), f"Could not read Cassandra or CSV ({exc})"
 
-    return pd.DataFrame(), "No processed CSV found and Cassandra driver/connection unavailable"
+    if os.path.exists(CSV_PATH):
+        return pd.read_csv(CSV_PATH), f"Processed CSV: {CSV_PATH}"
+
+    return pd.DataFrame(), "No Cassandra connection and no processed CSV found"
 
 @st.cache_resource(show_spinner=False)
 def load_model_artifacts():
@@ -125,6 +138,68 @@ def load_model_artifacts():
         with open(MEDIANS_PATH, "rb") as f:
             medians = pickle.load(f)
     return saved_model, saved_features, medians
+
+@st.cache_resource(show_spinner=False)
+def load_spark_model():
+    """Load the PySpark MLlib PipelineModel written by Spotify_PySpark_MLlib.ipynb.
+
+    Returns (spark, model) or (None, None). Lazy: no Spark session is started
+    until this is first called, and it is cached for the app's lifetime.
+    """
+    if not os.path.isdir(SPARK_MODEL_DIR):
+        return None, None
+    try:
+        os.environ.setdefault("HADOOP_HOME", r"C:\hadoop")
+        os.environ["PATH"] = os.path.join(os.environ["HADOOP_HOME"], "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
+        from pyspark.ml import PipelineModel
+        from pyspark.sql import SparkSession
+        spark = (
+            SparkSession.builder
+            .master("local[1]")
+            .appName("SpotifyDataLab")
+            .config("spark.driver.host", "127.0.0.1")
+            .config("spark.driver.bindAddress", "127.0.0.1")
+            .config("spark.hadoop.hadoop.home.dir", os.environ["HADOOP_HOME"])
+            .config("spark.ui.enabled", "false")
+            .config("spark.sql.shuffle.partitions", "4")
+            .getOrCreate()
+        )
+        spark.sparkContext.setLogLevel("ERROR")
+        model = PipelineModel.load(SPARK_MODEL_DIR)
+        return spark, model
+    except Exception:
+        return None, None
+
+
+def spark_predict(frame):
+    """Predict popularity with the MLlib PipelineModel. Returns a Series or None."""
+    spark, spark_model = load_spark_model()
+    if spark is None or spark_model is None:
+        return None
+    missing = [c for c in SPARK_AUDIO if c not in frame.columns]
+    if missing:
+        return None
+    try:
+        features = frame[SPARK_AUDIO].apply(pd.to_numeric, errors="coerce")
+        if "stream" in frame.columns:
+            stream = pd.to_numeric(frame["stream"], errors="coerce").clip(lower=0)
+            features["log1p_stream"] = np.log1p(stream)
+        else:
+            features["log1p_stream"] = np.nan
+        schema = (
+            "struct<" + ", ".join(f"{c}:double" for c in SPARK_FEATURES) + ">"
+        )
+        sdf = spark.createDataFrame(
+            [tuple(None if pd.isna(v) else float(v) for v in row)
+             for row in features[SPARK_FEATURES].itertuples(index=False, name=None)],
+            schema=schema,
+        )
+        preds = spark_model.transform(sdf).select("prediction").collect()
+        return pd.Series([float(r["prediction"]) for r in preds], index=frame.index)
+    except Exception:
+        return None
+
 
 df, data_source = load_data()
 model, model_features, saved_medians = load_model_artifacts()
@@ -226,6 +301,8 @@ st.sidebar.metric("Songs", f"{len(df):,}")
 st.sidebar.metric("Artists", f"{df['_artist_display'].replace('', np.nan).nunique():,}")
 st.sidebar.metric("Audio features", len(audio_features))
 st.sidebar.metric("Model status", "Loaded" if model is not None else "Not loaded")
+st.sidebar.metric("MLlib model", "Available" if os.path.isdir(SPARK_MODEL_DIR) else "Not built")
+st.sidebar.caption("MLlib model path: spotify_popularity_model/ (created by Spotify_PySpark_MLlib.ipynb)")
 
 overview_tab, artists_tab, explore_tab, recommend_tab, demo_tab, weights_tab = st.tabs([
     "Overview", "Top Artists", "Explore Songs", "Recommendations", "Model Demo", "Feature Weights"
@@ -394,7 +471,49 @@ with recommend_tab:
 
 with demo_tab:
     st.subheader("Popularity prediction")
-    if model is None or not model_features:
+    spark_available = os.path.isdir(SPARK_MODEL_DIR)
+    backend = "Scikit-learn"
+    if spark_available and model is not None:
+        backend = st.radio(
+            "Model backend",
+            ["PySpark MLlib", "Scikit-learn"],
+            horizontal=True,
+            help="MLlib model is written by Spotify_PySpark_MLlib.ipynb; the scikit-learn model is a fallback.",
+        )
+    elif spark_available:
+        backend = "PySpark MLlib"
+
+    if backend == "PySpark MLlib":
+        st.markdown('<div class="section-note">Adjust the sliders, then predict with the MLlib PipelineModel (audio features + log1p(stream)).</div>', unsafe_allow_html=True)
+        spark_inputs = {}
+        columns = st.columns(3)
+        for i, feature in enumerate(SPARK_AUDIO + ["stream"]):
+            box = columns[i % 3]
+            series = pd.to_numeric(df[feature], errors="coerce").dropna() if feature in df.columns else pd.Series(dtype=float)
+            if series.empty:
+                lo, hi, default = 0.0, 1.0, 0.0
+            else:
+                lo, hi = float(series.min()), float(series.quantile(0.99))
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    lo, hi = float(series.min()), float(series.max()) + 1.0
+                default = float(series.median())
+            if feature == "key":
+                lo_i, hi_i = int(np.floor(lo)), max(int(np.ceil(hi)), int(np.floor(lo)) + 1)
+                spark_inputs[feature] = box.slider("Key", lo_i, hi_i, int(np.clip(round(default), lo_i, hi_i)), step=1, key=f"mlib_{feature}")
+            else:
+                step = max((hi - lo) / 100, 0.01)
+                spark_inputs[feature] = box.slider(feature.replace("_", " ").title(), float(lo), float(hi),
+                                                   float(np.clip(default, lo, hi)), step=float(step),
+                                                   key=f"mlib_{feature}", format="%.2f")
+        if st.button("Predict popularity (MLlib)", type="primary"):
+            input_df = pd.DataFrame([spark_inputs])
+            result = spark_predict(input_df)
+            if result is None:
+                st.error("The MLlib model could not be loaded. Make sure PySpark and Hadoop (winutils) are installed, or re-run Spotify_PySpark_MLlib.ipynb.")
+            else:
+                st.metric("Predicted custom popularity score", f"{float(result.iloc[0]):.2f} / 100")
+                st.caption("Prediction of the project's custom score, not Spotify's official popularity score.")
+    elif model is None or not model_features:
         st.warning("Saved model files were not found. Run the updated model-training notebook cell first.")
     else:
         st.markdown('<div class="section-note">Adjust the sliders, then predict using the saved model inputs.</div>', unsafe_allow_html=True)
