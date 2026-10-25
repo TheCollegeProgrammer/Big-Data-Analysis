@@ -30,7 +30,7 @@ MODEL_PATH = os.path.join(OUTPUT_DIR, "popularity_model.pkl")
 FEATURES_PATH = os.path.join(OUTPUT_DIR, "model_features.pkl")
 MEDIANS_PATH = os.path.join(OUTPUT_DIR, "audio_feature_medians.pkl")
 
-# PipelineModel written by Spotify_PySpark_MLlib.ipynb (section 10).
+# PipelineModel written by Spotify_PySpark_MLlib.ipynb (section 9).
 SPARK_MODEL_DIR = "spotify_popularity_model"
 # Same feature order the notebook trains on: 11 audio features + log1p(stream).
 SPARK_AUDIO = [

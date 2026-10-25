@@ -7,3 +7,7 @@ spotify_popularity_model.pkl
 
 # Hadoop/Spark local filesystem checksums alongside model output
 *.crc
+
+# Scratch scripts and run logs from local verification
+temp/
+*.log
