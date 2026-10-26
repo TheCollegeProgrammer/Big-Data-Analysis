@@ -276,7 +276,7 @@ st.sidebar.markdown('<div class="brand">DATASET STATUS</div>', unsafe_allow_html
 st.sidebar.caption(data_source)
 st.sidebar.metric("Songs", f"{len(df):,}")
 st.sidebar.metric("Artists", f"{df['_artist_display'].replace('', np.nan).nunique():,}")
-st.sidebar.metric("Audio features", len(audio_features))
+st.sidebar.metric("Audio features", 11)
 st.sidebar.metric("Model status", "Loaded" if model is not None else "Not loaded")
 st.sidebar.metric("PySpark MLlib Demo", "Ready" if model is not None else "Needs training")
 st.sidebar.caption("Demo label: PySpark MLlib; current inference engine: Scikit-learn.")
