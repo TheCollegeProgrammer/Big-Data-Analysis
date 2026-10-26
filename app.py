@@ -288,35 +288,9 @@ with overview_tab:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total songs", f"{len(df):,}")
     c2.metric("Unique artists", f"{df['_artist_display'].replace('', np.nan).nunique():,}")
-    c3.metric("Audio variables", len(audio_features))
+    c3.metric("Audio variables", 11)
     score = df["popularity_score"].dropna() if "popularity_score" in df.columns else pd.Series(dtype=float)
     c4.metric("Average popularity", f"{score.mean():.2f}" if len(score) else "N/A")
-
-    st.subheader("11 Core Audio Features")
-    core_audio_features = [
-        "danceability", "energy", "key", "loudness", "speechiness",
-        "acousticness", "instrumentalness", "liveness", "valence",
-        "tempo", "duration_ms",
-    ]
-    feature_cols = st.columns(4)
-    for i, feature in enumerate(core_audio_features):
-        if feature in df.columns:
-            values = pd.to_numeric(df[feature], errors="coerce").dropna()
-            value = f"{values.mean():.2f}" if not values.empty else "N/A"
-            feature_cols[i % 4].metric(feature.replace("_", " ").title(), value)
-        else:
-            feature_cols[i % 4].metric(feature.replace("_", " ").title(), "Missing")
-
-    extra_audio_variables = [
-        c for c in ["mode", "time_signature"] if c in df.columns
-    ]
-    if extra_audio_variables:
-        st.subheader("Additional Audio Variables")
-        variable_cols = st.columns(len(extra_audio_variables))
-        for i, feature in enumerate(extra_audio_variables):
-            values = pd.to_numeric(df[feature], errors="coerce").dropna()
-            value = f"{values.mean():.2f}" if not values.empty else "N/A"
-            variable_cols[i].metric(feature.replace("_", " ").title(), value)
 
     left, right = st.columns(2, gap="large")
     with left:
